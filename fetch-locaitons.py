@@ -8,6 +8,44 @@ import requests
 import calendar
 from datetime import date, datetime, time as dtime
 from zoneinfo import ZoneInfo
+from transformers import AutoTokenizer, AutoModelForCausalLM
+import torch
+
+MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct"
+
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL_NAME,
+    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+    device_map="auto"
+)
+
+def llm(prompt: str) -> str:
+    messages = [{"role": "user", "content": prompt}]
+
+    inputs = tokenizer.apply_chat_template(
+        messages,
+        add_generation_prompt=True,
+        return_tensors="pt",
+    ).to(model.device)
+
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=200,
+            temperature=0.7,
+            top_p=0.9,
+            do_sample=True
+        )
+
+    result = tokenizer.decode(
+        outputs[0][inputs["input_ids"].shape[-1]:],
+        skip_special_tokens=True
+    )
+
+    return result.strip()
+
+
 TZ = ZoneInfo("America/Chicago")
 
 def month_dates(year: int, month: int) -> List[date]:
@@ -346,6 +384,6 @@ def ingest_month(year: int, month: int, db_path: str = DB_PATH) -> None:
         conn.close()
 
 if __name__ == "__main__":
-    # “this whole month” = current month
+\
     today = datetime.now(TZ).date()
     ingest_month(today.year, today.month)
