@@ -5,7 +5,19 @@ import time
 from datetime import datetime
 from typing import Any, Dict, List, Set
 import requests
+import calendar
+from datetime import date, datetime, time as dtime
+from zoneinfo import ZoneInfo
+TZ = ZoneInfo("America/Chicago")
 
+def month_dates(year: int, month: int) -> List[date]:
+    last_day = calendar.monthrange(year, month)[1]
+    return [date(year, month, d) for d in range(1, last_day + 1)]
+
+def epoch_for_local_noon(d: date) -> int:
+    # Noon local time is a stable choice
+    dt = datetime.combine(d, dtime(12, 0), tzinfo=TZ)
+    return int(dt.timestamp())
 BASE = "https://www.dining.iastate.edu/wp-json/dining/menu-hours"
 WARMUP = "https://www.dining.iastate.edu/hours-menus/"
 
@@ -201,16 +213,13 @@ def scrape_location_slugs_from_sitemap(session: requests.Session) -> List[str]:
 
     return sorted(slugs)
 
-
-def ingest_all(db_path: str = DB_PATH) -> None:
+def ingest_month(year: int, month: int, db_path: str = DB_PATH) -> None:
     session = make_session()
-
-    ts = MENU_TIME
-    day = iso_date_from_epoch(ts)
-    print(f"Using menu timestamp: {ts} (date={day})")
-
     slugs = scrape_location_slugs_from_sitemap(session)
     print(f"Found {len(slugs)} location slugs from sitemap")
+
+    dates = month_dates(year, month)
+    print(f"Fetching menus for {year}-{month:02d} ({len(dates)} days)")
 
     conn = sqlite3.connect(db_path)
     try:
@@ -219,121 +228,124 @@ def ingest_all(db_path: str = DB_PATH) -> None:
         total_locations = 0
         total_items = 0
 
-        for i, slug in enumerate(slugs, start=1):
-            url = f"{BASE}/get-single-location/?slug={slug}&time={ts}"
+        for d in dates:
+            ts = epoch_for_local_noon(d)
+            day = d.strftime("%Y-%m-%d")
+            print(f"\n=== {day} (time={ts}) ===")
 
-            try:
-                data = fetch_json(session, url)
-            except Exception as e:
-                print(f"[WARN] ({i}/{len(slugs)}) slug={slug} failed: {e}")
-                continue
+            for i, slug in enumerate(slugs, start=1):
+                url = f"{BASE}/get-single-location/?slug={slug}&time={ts}"
 
-            if not (isinstance(data, list) and data):
-                print(f"[WARN] ({i}/{len(slugs)}) slug={slug} empty payload")
-                continue
+                try:
+                    data = fetch_json(session, url)
+                except Exception as e:
+                    print(f"[WARN] {day} slug={slug} failed: {e}")
+                    continue
 
-            payload = data[0]
-            menus = payload.get("menus") or []
+                if not (isinstance(data, list) and data):
+                    continue
 
-            # insert/update location
-            upsert_location(conn, payload)
-            total_locations += 1
+                payload = data[0]
+                menus = payload.get("menus") or []
 
-            loc_id = int(payload["id"])
-            title = payload.get("title") or slug
+                # Always store location metadata (even if menus empty)
+                upsert_location(conn, payload)
+                total_locations += 1
 
-            # deterministic reruns
-            conn.execute(
-                "DELETE FROM menu_items WHERE location_id=? AND fetched_for_date=?",
-                (loc_id, day),
-            )
+                loc_id = int(payload["id"])
+                title = payload.get("title") or slug
 
-            inserted_here = 0
+                # Clear rows for this location+day so reruns don’t duplicate
+                conn.execute(
+                    "DELETE FROM menu_items WHERE location_id=? AND fetched_for_date=?",
+                    (loc_id, day),
+                )
 
-            for menu in menus:
-                section = menu.get("section")
-                for display in menu.get("menuDisplays") or []:
-                    station = display.get("name")
-                    for cat in display.get("categories") or []:
-                        category = cat.get("category")
-                        for item in cat.get("menuItems") or []:
-                            cals_raw = item.get("totalCal")
-                            try:
-                                calories = int(float(cals_raw)) if cals_raw not in (None, "", "0") else 0
-                            except ValueError:
-                                calories = 0
+                inserted_here = 0
 
-                            cur = conn.execute("""
-                              INSERT INTO menu_items (
-                                location_id, menu_section, station, category, name,
-                                serving_size, calories, ingredients,
-                                is_halal, is_vegetarian, is_vegan,
-                                fetched_for_date, fetched_at
-                              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                            """, (
-                                loc_id,
-                                section,
-                                station,
-                                category,
-                                item.get("name"),
-                                item.get("servingSize"),
-                                calories,
-                                item.get("ingredients"),
-                                int(item.get("isHalal") or 0),
-                                int(item.get("isVegetarian") or 0),
-                                int(item.get("isVegan") or 0),
-                                day,
-                                ts
-                            ))
-                            item_id = cur.lastrowid
-                            inserted_here += 1
+                for menu in menus:
+                    section = menu.get("section")
+                    for display in menu.get("menuDisplays") or []:
+                        station = display.get("name")
+                        for cat in display.get("categories") or []:
+                            category = cat.get("category")
+                            for item in cat.get("menuItems") or []:
+                                cals_raw = item.get("totalCal")
+                                try:
+                                    calories = int(float(cals_raw)) if cals_raw not in (None, "", "0") else 0
+                                except ValueError:
+                                    calories = 0
 
-                            for n in parse_json_string_list(item.get("nutrients")):
-                                conn.execute("""
-                                  INSERT INTO item_nutrients (item_id, name, qty, rounded_qty, percent)
-                                  VALUES (?, ?, ?, ?, ?)
+                                cur = conn.execute("""
+                                  INSERT INTO menu_items (
+                                    location_id, menu_section, station, category, name,
+                                    serving_size, calories, ingredients,
+                                    is_halal, is_vegetarian, is_vegan,
+                                    fetched_for_date, fetched_at
+                                  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                                 """, (
-                                    item_id,
-                                    n.get("name"),
-                                    str(n.get("qty")) if n.get("qty") is not None else None,
-                                    str(n.get("roundedQty")) if n.get("roundedQty") is not None else None,
-                                    str(n.get("roundedPercentOfGoal")) if n.get("roundedPercentOfGoal") is not None else None,
+                                    loc_id,
+                                    section,
+                                    station,
+                                    category,
+                                    item.get("name"),
+                                    item.get("servingSize"),
+                                    calories,
+                                    item.get("ingredients"),
+                                    int(item.get("isHalal") or 0),
+                                    int(item.get("isVegetarian") or 0),
+                                    int(item.get("isVegan") or 0),
+                                    day,
+                                    ts
                                 ))
+                                item_id = cur.lastrowid
+                                inserted_here += 1
 
-                            for t in parse_json_string_list(item.get("traits")):
-                                conn.execute("""
-                                  INSERT INTO item_traits (item_id, oid, name, type_name)
-                                  VALUES (?, ?, ?, ?)
-                                """, (
-                                    item_id,
-                                    str(t.get("oid")) if t.get("oid") is not None else None,
-                                    t.get("name"),
-                                    t.get("typeName"),
-                                ))
+                                for n in parse_json_string_list(item.get("nutrients")):
+                                    conn.execute("""
+                                      INSERT INTO item_nutrients (item_id, name, qty, rounded_qty, percent)
+                                      VALUES (?, ?, ?, ?, ?)
+                                    """, (
+                                        item_id,
+                                        n.get("name"),
+                                        str(n.get("qty")) if n.get("qty") is not None else None,
+                                        str(n.get("roundedQty")) if n.get("roundedQty") is not None else None,
+                                        str(n.get("roundedPercentOfGoal")) if n.get("roundedPercentOfGoal") is not None else None,
+                                    ))
 
-            conn.commit()
-            total_items += inserted_here
+                                for t in parse_json_string_list(item.get("traits")):
+                                    conn.execute("""
+                                      INSERT INTO item_traits (item_id, oid, name, type_name)
+                                      VALUES (?, ?, ?, ?)
+                                    """, (
+                                        item_id,
+                                        str(t.get("oid")) if t.get("oid") is not None else None,
+                                        t.get("name"),
+                                        t.get("typeName"),
+                                    ))
 
-            print(f"[OK] ({i}/{len(slugs)}) {title} ({slug}) menus={len(menus)} items={inserted_here}")
+                conn.commit()
+                total_items += inserted_here
 
-            time.sleep(0.15)
+                if inserted_here > 0:
+                    print(f"[OK] {day} {title} items={inserted_here}")
 
-        # summary counts
+                time.sleep(0.10)  # be nice to their server
+
         cur = conn.cursor()
         cur.execute("SELECT COUNT(*) FROM locations")
         loc_count = cur.fetchone()[0]
         cur.execute("SELECT COUNT(*) FROM menu_items")
         item_count = cur.fetchone()[0]
 
-        print("-----")
-        print(f"Locations upserted this run: {total_locations}")
-        print(f"Menu items inserted:         {total_items}")
+        print("\n-----")
         print(f"DB totals -> locations={loc_count}, menu_items={item_count}")
         print(f"DB saved to: {db_path}")
 
     finally:
         conn.close()
 
-
 if __name__ == "__main__":
-    ingest_all()
+    # “this whole month” = current month
+    today = datetime.now(TZ).date()
+    ingest_month(today.year, today.month)
